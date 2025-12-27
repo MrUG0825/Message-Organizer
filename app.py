@@ -1,25 +1,13 @@
-# app.py
-# LINE Bot：訊息關鍵字日報整理（群組/好友皆可）
-# 功能：
-# - Follow/Join 歡迎訊息
-# - Carousel 功能選單（立即整理 / 關鍵字管理 / 每日定時設定）
-# - 設定/查看/刪除關鍵字（刪除：按鈕點一下就刪，不用手打）
-# - 每個關鍵字輸出「獨立 txt」：YYYYMMDD_關鍵字_chatid.txt
-# - 本地輸出放在同一資料夾：OUT_DIR/YYYY-MM/
-# - 同時回傳群組「可下載連結」（含下載保護 token）
-# - 同時回傳群組一份「檔案訊息」做備份（若 SDK 不支援則回連結）
-# - 內建台北時區（zoneinfo）
-# - 內建排程：每分鐘 tick，到了你設定的 HH:MM 就自動整理並 push
-
 import os
-import re
 import json
-import secrets
+import hmac
+import base64
+import hashlib
 from pathlib import Path
-from datetime import datetime
-from typing import Optional, Tuple, List
+from datetime import datetime, timedelta
 
-from flask import Flask, request, abort, send_file
+from flask import Flask, request, abort, send_from_directory
+from dotenv import load_dotenv
 
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -31,7 +19,6 @@ from linebot.v3.messaging import (
     PushMessageRequest,
     TextMessage,
 )
-
 from linebot.v3.webhooks import (
     MessageEvent,
     TextMessageContent,
@@ -40,87 +27,79 @@ from linebot.v3.webhooks import (
     PostbackEvent,
 )
 
-from dotenv import load_dotenv
-
 # -----------------------------
 # Env
 # -----------------------------
 load_dotenv()
 
 TZ_NAME = os.getenv("TZ_NAME", "Asia/Taipei")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip(
+    "/"
+)  # e.g. https://message-organizer.onrender.com
+CRON_TOKEN = os.getenv("CRON_TOKEN", "")  # protect /cron/tick
+DOWNLOAD_SECRET = os.getenv("DOWNLOAD_SECRET", "")  # protect download links
 
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 
-# 公開網址（Render）：用來組「下載連結」
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-
-# 下載保護 token（你已決定要開啟）
-FILE_TOKEN = os.getenv("FILE_TOKEN", "")
-
-# 你本機/伺服器資料資料夾
-BASE_DIR = Path(os.getenv("BOT_DATA_DIR", "./bot_data")).resolve()
-LOG_DIR = (BASE_DIR / "logs").resolve()  # logs/<chat_id>/YYYY-MM-DD.jsonl
-CFG_DIR = (BASE_DIR / "configs").resolve()  # configs/<chat_id>.json
-OUT_DIR = (BASE_DIR / "exports").resolve()  # exports/YYYY-MM/*.txt
-
-for d in (LOG_DIR, CFG_DIR, OUT_DIR):
-    d.mkdir(parents=True, exist_ok=True)
-
 print("ENV OK:", bool(LINE_CHANNEL_ACCESS_TOKEN), bool(LINE_CHANNEL_SECRET))
-if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
-    print("[WARN] Missing env vars: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET")
 
-if not PUBLIC_BASE_URL:
-    print("[WARN] PUBLIC_BASE_URL is empty. Download links will be unavailable.")
-if not FILE_TOKEN:
+if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
     print(
-        "[WARN] FILE_TOKEN is empty. Download protection is NOT enabled (you said you want it on)."
+        "[WARN] Missing env vars: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET. "
+        "Set them before deploying."
     )
 
+if not PUBLIC_BASE_URL:
+    print("[WARN] PUBLIC_BASE_URL not set. Download links may not work.")
+
+if not DOWNLOAD_SECRET:
+    print("[WARN] DOWNLOAD_SECRET not set. Download protection will fail (set it!).")
+
 
 # -----------------------------
-# Timezone (Taipei)
+# Timezone (Asia/Taipei) - stable
 # -----------------------------
 def now_tpe() -> datetime:
-    """
-    保證台北時間：
-    - Python 3.9+ 內建 zoneinfo
-    - 若系統缺 tzdata，仍會依系統時區；建議在 Render 不會有問題
-    """
+    """Return timezone-aware now in Asia/Taipei using stdlib zoneinfo."""
     try:
-        from zoneinfo import ZoneInfo
+        from zoneinfo import ZoneInfo  # py3.9+
 
         return datetime.now(ZoneInfo(TZ_NAME))
     except Exception:
+        # fallback: server local time
         return datetime.now()
 
 
-def today_ymd(dt: Optional[datetime] = None) -> str:
+def today_str(dt: datetime | None = None) -> str:
     dt = dt or now_tpe()
     return dt.strftime("%Y-%m-%d")
 
 
-def month_ym(dt: Optional[datetime] = None) -> str:
-    dt = dt or now_tpe()
-    return dt.strftime("%Y-%m")
-
-
-def today_compact(dt: Optional[datetime] = None) -> str:
+def yyyymmdd(dt: datetime | None = None) -> str:
     dt = dt or now_tpe()
     return dt.strftime("%Y%m%d")
 
 
-def hhmm(dt: Optional[datetime] = None) -> str:
+def yyyymm(dt: datetime | None = None) -> str:
     dt = dt or now_tpe()
-    return dt.strftime("%H:%M")
+    return dt.strftime("%Y-%m")
 
 
 # -----------------------------
-# Helpers: chat_id / config / logging
+# Storage
 # -----------------------------
+BASE_DIR = Path(os.getenv("BOT_DATA_DIR", "./bot_data"))
+LOG_DIR = BASE_DIR / "logs"  # logs/<chat_id>/YYYY-MM-DD.jsonl
+CFG_DIR = BASE_DIR / "configs"  # configs/<chat_id>.json
+OUT_DIR = BASE_DIR / "exports"  # exports/YYYY-MM/<files>
+
+for d in (LOG_DIR, CFG_DIR, OUT_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
+
 def get_chat_id(event) -> str:
-    """把 user / group / room 統一成一個 chat_id 供檔名、push 使用。"""
+    """Unify user/group/room into one id."""
     src = getattr(event, "source", None)
     if not src:
         return "unknown"
@@ -132,7 +111,7 @@ def get_chat_id(event) -> str:
 
 
 def cfg_path(chat_id: str) -> Path:
-    return (CFG_DIR / f"{chat_id}.json").resolve()
+    return CFG_DIR / f"{chat_id}.json"
 
 
 def load_cfg(chat_id: str) -> dict:
@@ -140,19 +119,25 @@ def load_cfg(chat_id: str) -> dict:
     if not p.exists():
         return {
             "keywords": [],
-            "daily_time": None,  # "HH:MM"
-            "last_daily_run": None,  # "YYYY-MM-DD"
+            "daily_enabled": False,
+            "daily_time": "23:59",  # HH:MM
+            "last_run_date": "",  # YYYY-MM-DD
         }
     try:
-        obj = json.loads(p.read_text(encoding="utf-8"))
-        if not isinstance(obj, dict):
-            raise ValueError("cfg not dict")
+        cfg = json.loads(p.read_text(encoding="utf-8"))
+        # fill defaults
+        cfg.setdefault("keywords", [])
+        cfg.setdefault("daily_enabled", False)
+        cfg.setdefault("daily_time", "23:59")
+        cfg.setdefault("last_run_date", "")
+        return cfg
     except Exception:
-        obj = {}
-    obj.setdefault("keywords", [])
-    obj.setdefault("daily_time", None)
-    obj.setdefault("last_daily_run", None)
-    return obj
+        return {
+            "keywords": [],
+            "daily_enabled": False,
+            "daily_time": "23:59",
+            "last_run_date": "",
+        }
 
 
 def save_cfg(chat_id: str, cfg: dict) -> None:
@@ -162,10 +147,10 @@ def save_cfg(chat_id: str, cfg: dict) -> None:
 
 
 def append_log(chat_id: str, message_text: str, event) -> None:
-    day = today_ymd()
-    d = (LOG_DIR / chat_id).resolve()
+    day = today_str()
+    d = LOG_DIR / chat_id
     d.mkdir(parents=True, exist_ok=True)
-    p = (d / f"{day}.jsonl").resolve()
+    p = d / f"{day}.jsonl"
 
     src = getattr(event, "source", None)
     payload = {
@@ -179,47 +164,61 @@ def append_log(chat_id: str, message_text: str, event) -> None:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
-def normalize_keyword(k: str) -> str:
-    return k.strip()
+# -----------------------------
+# Download protection (signed token)
+# token format: base64url("exp:<unix>|sig:<hex>")
+# sig = HMAC_SHA256(secret, f"{relpath}|{exp}")
+# -----------------------------
+def _b64url_encode(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode("utf-8").rstrip("=")
 
 
-def safe_filename_keyword(k: str) -> str:
-    """
-    檔名安全化（保留中英數與常見字，其他換成底線）
-    """
-    k = k.strip()
-    k = re.sub(r"[\\/:*?\"<>|]+", "_", k)
-    k = re.sub(r"\s+", "_", k)
-    return k[:50] if len(k) > 50 else k
+def _b64url_decode(s: str) -> bytes:
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad)
 
 
-def make_public_url(relpath: str) -> Optional[str]:
-    if not PUBLIC_BASE_URL:
-        return None
-    token_part = f"?token={FILE_TOKEN}" if FILE_TOKEN else ""
-    return f"{PUBLIC_BASE_URL}/files/{relpath}{token_part}"
+def make_download_token(rel_path: str, expires_in_sec: int = 3600) -> str:
+    exp = int((now_tpe() + timedelta(seconds=expires_in_sec)).timestamp())
+    msg = f"{rel_path}|{exp}".encode("utf-8")
+    sig = hmac.new(DOWNLOAD_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    raw = f"exp:{exp}|sig:{sig}".encode("utf-8")
+    return _b64url_encode(raw)
+
+
+def verify_download_token(rel_path: str, token: str) -> bool:
+    if not DOWNLOAD_SECRET:
+        return False
+    try:
+        raw = _b64url_decode(token).decode("utf-8")
+        parts = dict(p.split(":", 1) for p in raw.split("|"))
+        exp = int(parts["exp"])
+        sig = parts["sig"]
+        if int(now_tpe().timestamp()) > exp:
+            return False
+        msg = f"{rel_path}|{exp}".encode("utf-8")
+        expected = hmac.new(
+            DOWNLOAD_SECRET.encode("utf-8"), msg, hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(sig, expected)
+    except Exception:
+        return False
 
 
 # -----------------------------
-# Summarize: per keyword -> one txt
+# Summarize / Export (one file per keyword)
 # -----------------------------
-def summarize_today_per_keyword(
-    chat_id: str, *, manual: bool
-) -> Tuple[bool, str, List[dict]]:
+def summarize_today(
+    chat_id: str, *, manual: bool = False
+) -> tuple[bool, str, list[str]]:
     """
-    依每個關鍵字輸出獨立檔案。
-    回傳：
-      ok, summary_text, outputs
-      outputs: [{keyword, out_path, relpath, url}]
+    Returns:
+        ok, message_to_user, download_urls(list)
     """
     cfg = load_cfg(chat_id)
-    keywords = [
-        normalize_keyword(k)
-        for k in cfg.get("keywords", [])
-        if isinstance(k, str) and k.strip()
+    keywords: list[str] = [
+        k for k in cfg.get("keywords", []) if isinstance(k, str) and k.strip()
     ]
-    keywords = sorted(set(keywords), key=lambda x: x.lower())
-
     if not keywords:
         return (
             False,
@@ -227,93 +226,89 @@ def summarize_today_per_keyword(
             [],
         )
 
-    day = today_ymd()
-    log_file = (LOG_DIR / chat_id / f"{day}.jsonl").resolve()
+    day = today_str()
+    log_file = LOG_DIR / chat_id / f"{day}.jsonl"
     if not log_file.exists():
-        return (True, f"今天（{day}）尚無紀錄訊息可整理。", [])
+        return (True, f"今天 ({day}) 尚無紀錄訊息可整理。", [])
 
-    # 讀所有訊息
-    texts: List[str] = []
+    # prepare per-keyword buckets
+    buckets: dict[str, list[str]] = {k: [] for k in keywords}
+    total = 0
+
     with log_file.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
+            total += 1
             try:
                 obj = json.loads(line)
             except Exception:
                 continue
-            t = str(obj.get("text", "")).strip()
-            if t:
-                texts.append(t)
 
-    total = len(texts)
-    if total == 0:
-        return (True, f"今天（{day}）尚無紀錄訊息可整理。", [])
+            text = str(obj.get("text", "")).strip()
+            ts = str(obj.get("ts", ""))
 
-    ym_folder = month_ym()
-    out_month_dir = (OUT_DIR / ym_folder).resolve()
+            # clean output line: only message text (optionally keep HH:MM)
+            # here we keep HH:MM for readability but no UID / no header
+            hhmm = ""
+            try:
+                # ts like 2025-12-27T14:05:00+08:00 or without tz
+                hhmm = ts.split("T", 1)[1][:5] if "T" in ts else ""
+            except Exception:
+                hhmm = ""
+
+            clean_line = f"{hhmm} {text}".strip() if hhmm else text
+
+            for k in keywords:
+                if k in text:
+                    buckets[k].append(clean_line)
+
+    # write files
+    out_month_dir = OUT_DIR / yyyymm()
     out_month_dir.mkdir(parents=True, exist_ok=True)
 
-    outputs: List[dict] = []
-    matched_any = False
-
-    for kw in keywords:
-        matched_lines = [t for t in texts if kw in t]
-        if not matched_lines:
+    urls: list[str] = []
+    written = 0
+    for k, lines in buckets.items():
+        if not lines:
             continue
+        filename = f"{yyyymmdd()}_{k}_{chat_id}.txt"
+        file_path = out_month_dir / filename
+        file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        written += 1
 
-        matched_any = True
-        fn_kw = safe_filename_keyword(kw)
-        filename = f"{today_compact()}_{fn_kw}_{chat_id}.txt"
-        out_path = (out_month_dir / filename).resolve()
+        # build protected link
+        rel = f"{yyyymm()}/{filename}"  # relative under exports
+        token = make_download_token(rel, expires_in_sec=3600)
+        if PUBLIC_BASE_URL:
+            urls.append(f"{PUBLIC_BASE_URL}/files/{rel}?token={token}")
+        else:
+            urls.append(str(file_path))
 
-        # 你要「乾淨訊息」：只輸出訊息本文，一行一則
-        out_path.write_text("\n".join(matched_lines) + "\n", encoding="utf-8")
-
-        relpath = f"{ym_folder}/{filename}"
-        url = make_public_url(relpath)
-
-        outputs.append(
-            {
-                "keyword": kw,
-                "out_path": str(out_path),
-                "relpath": relpath,
-                "url": url,
-            }
-        )
-
-    mode = "手動" if manual else "自動"
-
-    if not matched_any:
+    if written == 0:
         return (
             True,
-            f"{mode}整理完成 ✅\n日期：{day}\n共 {total} 則訊息，但沒有任何關鍵字命中。\n"
-            f"目前關鍵字：{', '.join(keywords)}",
+            f"今日 ({day}) 共記錄 {total} 則訊息，但沒有符合關鍵字：{', '.join(keywords)}",
             [],
         )
 
-    # 給聊天室看的摘要（含下載連結）
-    lines = [
-        f"{mode}整理完成 ✅",
-        f"日期：{day}",
-        f"總訊息：{total} 則",
-        "",
-        "已輸出檔案（每關鍵字一份）：",
-    ]
-    for o in outputs:
-        if o["url"]:
-            lines.append(f"- {o['keyword']}：{o['url']}")
-        else:
-            lines.append(
-                f"- {o['keyword']}：{o['out_path']}（未設定 PUBLIC_BASE_URL，無法產生連結）"
-            )
+    mode = "手動" if manual else "自動"
+    msg = (
+        f"{mode}整理完成 ✅\n"
+        f"日期：{day}\n"
+        f"總訊息：{total} 則\n"
+        f"已輸出檔案（每關鍵字一份）：{written} 份\n"
+    )
+    # ✅ 只回 1 組連結（同一段，列出所有檔案連結即可）
+    if urls:
+        msg += "\n下載連結（有效 60 分鐘）：\n" + "\n".join([f"- {u}" for u in urls])
 
-    return (True, "\n".join(lines), outputs)
+    return (True, msg, urls)
 
 
 # -----------------------------
-# LINE API
+# LINE API helpers
 # -----------------------------
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -329,16 +324,16 @@ def reply_text(reply_token: str, text: str):
         )
 
 
-def push_text(to_chat_id: str, text: str):
+def push_text(to: str, text: str):
     with ApiClient(configuration) as api_client:
         api = MessagingApi(api_client)
         api.push_message_with_http_info(
-            PushMessageRequest(to=to_chat_id, messages=[TextMessage(text=text)])
+            PushMessageRequest(to=to, messages=[TextMessage(text=text)])
         )
 
 
 def reply_menu(reply_token: str):
-    """Carousel Template 功能選單（含：立即整理 / 關鍵字管理 / 每日定時設定）"""
+    """Carousel menu (clean, no duplicated buttons)."""
     try:
         from linebot.v3.messaging import (
             TemplateMessage,
@@ -349,38 +344,35 @@ def reply_menu(reply_token: str):
     except Exception:
         return reply_text(
             reply_token,
-            "功能選單（文字版）\n\n"
-            "• 設定關鍵字：設定關鍵字 日報表\n"
-            "• 立即整理：立即整理\n"
-            "• 查看關鍵字：查看關鍵字\n"
-            "• 刪除關鍵字：刪除關鍵字（會跳出按鈕）\n"
-            "• 設定每日時間：設定每日時間 23:55\n"
-            "• 關閉每日整理：關閉每日整理\n",
+            "功能選單（純文字模式）\n\n"
+            "✅ 立即整理：立即整理\n"
+            "✅ 關鍵字：設定關鍵字 / 查看關鍵字 / 刪除關鍵字\n"
+            "✅ 每日定時：設定每日時間 / 關閉每日整理 / 查看目前設定\n",
         )
 
     template = CarouselTemplate(
         columns=[
             CarouselColumn(
                 title="每日訊息整理",
-                text="立即整理 / 產生下載連結 + 備份檔案",
+                text="立即整理 / 產生下載連結",
                 actions=[
                     PostbackAction(label="立即整理", data="action=run_now"),
-                    PostbackAction(label="查看關鍵字", data="action=list_keyword"),
-                    PostbackAction(label="刪除關鍵字", data="action=delete_keyword"),
                 ],
             ),
             CarouselColumn(
                 title="關鍵字管理",
-                text="新增/查看/刪除關鍵字",
+                text="新增 / 查看 / 刪除",
                 actions=[
                     PostbackAction(label="設定關鍵字", data="action=set_keyword"),
                     PostbackAction(label="查看關鍵字", data="action=list_keyword"),
-                    PostbackAction(label="刪除關鍵字", data="action=delete_keyword"),
+                    PostbackAction(
+                        label="刪除關鍵字", data="action=delete_keyword_menu"
+                    ),
                 ],
             ),
             CarouselColumn(
                 title="每日定時設定",
-                text="設定每天自動整理時間（HH:MM）",
+                text="設定每天自動整理時間 (HH:MM)",
                 actions=[
                     PostbackAction(label="設定每日時間", data="action=set_daily_time"),
                     PostbackAction(label="關閉每日整理", data="action=disable_daily"),
@@ -391,6 +383,45 @@ def reply_menu(reply_token: str):
     )
 
     msg = TemplateMessage(alt_text="功能選單", template=template)
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        api.reply_message_with_http_info(
+            ReplyMessageRequest(reply_token=reply_token, messages=[msg])
+        )
+
+
+def reply_keyword_delete_buttons(reply_token: str, chat_id: str):
+    """Show keyword list; each keyword becomes one postback button; tap to delete."""
+    cfg = load_cfg(chat_id)
+    kws = [k for k in cfg.get("keywords", []) if isinstance(k, str) and k.strip()]
+    if not kws:
+        return reply_text(reply_token, "目前沒有任何關鍵字可刪除。")
+
+    # Use QuickReply (clean & scalable)
+    try:
+        from linebot.v3.messaging import (
+            QuickReply,
+            QuickReplyItem,
+            PostbackAction,
+            TextMessage,
+        )
+    except Exception:
+        # fallback text list
+        return reply_text(
+            reply_token,
+            "目前關鍵字：\n- " + "\n- ".join(kws) + "\n\n請手動輸入：刪除關鍵字 XXX",
+        )
+
+    items = []
+    for k in kws[:13]:  # LINE quick reply limit (safe)
+        items.append(
+            QuickReplyItem(
+                action=PostbackAction(label=k, data=f"action=delete_kw&kw={k}")
+            )
+        )
+
+    text = "點一下要刪除的關鍵字："
+    msg = TextMessage(text=text, quick_reply=QuickReply(items=items))
 
     with ApiClient(configuration) as api_client:
         api = MessagingApi(api_client)
@@ -399,151 +430,152 @@ def reply_menu(reply_token: str):
         )
 
 
-def reply_delete_keyword_buttons(reply_token: str, chat_id: str):
-    """
-    點「刪除關鍵字」後：
-      bot 直接回「目前關鍵字清單」+ 每個關鍵字一個按鈕（postback）
-      點一下就刪，不用手打
-    """
-    cfg = load_cfg(chat_id)
-    kws = [k for k in cfg.get("keywords", []) if isinstance(k, str) and k.strip()]
-    kws = sorted(set(kws), key=lambda x: x.lower())
-
-    if not kws:
-        return reply_text(
-            reply_token,
-            "目前尚未設定任何關鍵字。\n\n請輸入：設定關鍵字 你的關鍵字\n例如：設定關鍵字 日報表",
-        )
-
-    # 優先用 QuickReply（最像「一排按鈕」）
+# -----------------------------
+# Daily schedule logic (tick-based)
+# -----------------------------
+def _parse_hhmm(s: str) -> tuple[int, int] | None:
     try:
-        from linebot.v3.messaging import QuickReply, QuickReplyItem, PostbackAction
-
-        items = []
-        for k in kws[:13]:  # QuickReply 大致上限 13
-            items.append(
-                QuickReplyItem(
-                    action=PostbackAction(
-                        label=f"刪除：{k}", data=f"action=del_kw&kw={k}"
-                    )
-                )
-            )
-
-        text = "點選要刪除的關鍵字（點一下就刪）：\n\n" + "\n".join(
-            [f"- {k}" for k in kws]
-        )
-        msg = TextMessage(text=text, quick_reply=QuickReply(items=items))
-
-        with ApiClient(configuration) as api_client:
-            api = MessagingApi(api_client)
-            api.reply_message_with_http_info(
-                ReplyMessageRequest(reply_token=reply_token, messages=[msg])
-            )
-        return
-
+        hh, mm = s.strip().split(":")
+        hh = int(hh)
+        mm = int(mm)
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return hh, mm
     except Exception:
-        # fallback：純文字提示
-        return reply_text(
-            reply_token,
-            "目前關鍵字：\n- "
-            + "\n- ".join(kws)
-            + "\n\n（你的 SDK 版本不支援按鈕刪除，請改用：刪除關鍵字 關鍵字）",
-        )
+        pass
+    return None
 
 
-def try_send_file_message(
-    to_chat_id: str, file_name: str, file_url: str, file_size: int
-) -> bool:
+def run_scheduled_tick() -> list[str]:
     """
-    嘗試用 LINE 的 file message 類型做「聊天室備份」。
-    若 SDK 版本/通道不支援，回傳 False。
+    Scan all chats; if daily_enabled and time passed and not run today -> run summarize & push message.
+    Returns log lines.
     """
-    try:
-        from linebot.v3.messaging import FileMessage
-    except Exception:
-        return False
+    logs = []
+    now = now_tpe()
+    today = today_str(now)
 
+    for p in CFG_DIR.glob("*.json"):
+        chat_id = p.stem
+        cfg = load_cfg(chat_id)
+
+        if not cfg.get("daily_enabled", False):
+            continue
+
+        hhmm = _parse_hhmm(str(cfg.get("daily_time", "23:59")))
+        if not hhmm:
+            continue
+
+        hh, mm = hhmm
+        due = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+        # if now >= due and not yet run today -> run
+        if now >= due and cfg.get("last_run_date", "") != today:
+            ok, msg, _ = summarize_today(chat_id, manual=False)
+            try:
+                push_text(chat_id, msg)  # ✅ only one message (contains links)
+                cfg["last_run_date"] = today
+                save_cfg(chat_id, cfg)
+                logs.append(f"[OK] {chat_id} ran daily at {hh:02d}:{mm:02d}")
+            except Exception as e:
+                logs.append(f"[WARN] push failed {chat_id}: {e}")
+
+    return logs
+
+
+# Optional APScheduler (still useful on paid always-on)
+def setup_scheduler_optional():
+    if os.getenv("ENABLE_APSCHEDULER", "0") != "1":
+        print(
+            "[INFO] APScheduler disabled. Use /cron/tick with Render Cron Job instead."
+        )
+        return None
     try:
-        with ApiClient(configuration) as api_client:
-            api = MessagingApi(api_client)
-            api.push_message_with_http_info(
-                PushMessageRequest(
-                    to=to_chat_id,
-                    messages=[
-                        FileMessage(
-                            original_content_url=file_url,
-                            file_name=file_name,
-                            file_size=file_size,
-                        )
-                    ],
-                )
-            )
-        return True
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.interval import IntervalTrigger
     except Exception:
-        return False
+        print(
+            "[WARN] APScheduler not installed. Set ENABLE_APSCHEDULER=0 or install APScheduler."
+        )
+        return None
+
+    sched = BackgroundScheduler(timezone=TZ_NAME)
+    sched.add_job(
+        run_scheduled_tick, IntervalTrigger(minutes=1), id="tick", replace_existing=True
+    )
+    sched.start()
+    print("[INFO] APScheduler enabled: tick every 1 minute.")
+    return sched
 
 
 # -----------------------------
-# Flask routes
+# Flask
 # -----------------------------
 app = Flask(__name__)
 
 
 @app.get("/")
-def home():
+def index():
     return "OK"
 
 
-@app.post("/callback")
+@app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
-    app.logger.info("Request body: %s", body)
 
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        app.logger.info("Invalid signature. Check channel secret/access token.")
         abort(400)
 
     return "OK"
 
 
+# Download endpoint (protected)
 @app.get("/files/<path:relpath>")
 def download_file(relpath: str):
-    """
-    下載連結：
-      /files/YYYY-MM/filename.txt?token=FILE_TOKEN
-    """
-    # token 保護
-    if FILE_TOKEN:
-        if request.args.get("token", "") != FILE_TOKEN:
-            abort(403)
+    token = request.args.get("token", "")
+    # relpath is like "2025-12/20251227_關鍵字_chatid.txt"
+    if not token or not verify_download_token(relpath, token):
+        abort(403)
 
-    base = OUT_DIR.resolve()
-    target = (OUT_DIR / relpath).resolve()
+    # serve from OUT_DIR
+    # directory: exports/<YYYY-MM>
+    parts = relpath.split("/", 1)
+    if len(parts) != 2:
+        abort(404)
+    month_dir, filename = parts[0], parts[1]
 
-    # 防止 ../ 逃逸
-    if not str(target).startswith(str(base)):
-        abort(400)
-
-    if not target.exists() or not target.is_file():
+    directory = OUT_DIR / month_dir
+    if not (directory / filename).exists():
         abort(404)
 
-    return send_file(target, as_attachment=True)
+    return send_from_directory(directory, filename, as_attachment=True)
+
+
+# Cron tick endpoint (protected)
+@app.get("/cron/tick")
+def cron_tick():
+    if not CRON_TOKEN:
+        abort(403)
+    token = request.args.get("token", "")
+    if token != CRON_TOKEN:
+        abort(403)
+    logs = run_scheduled_tick()
+    return {"ok": True, "logs": logs, "ts": now_tpe().isoformat(timespec="seconds")}
 
 
 # -----------------------------
-# Welcome
+# Welcome message
 # -----------------------------
 @handler.add(FollowEvent)
 def handle_follow(event):
     reply_text(
         event.reply_token,
         "嗨～歡迎加入 ✨\n"
-        "我是『訊息整理小幫手』，可以把你指定關鍵字的訊息整理成 txt（日報）。\n\n"
+        "我是『訊息整理小幫手』，可以把你指定關鍵字的訊息整理成 txt 並提供下載連結。\n\n"
         "先試試看：\n"
-        "1) 輸入『功能選單』\n"
+        "1) 輸入『功能選單』開啟功能\n"
         "2) 或直接輸入：設定關鍵字 日報表\n",
     )
 
@@ -553,7 +585,7 @@ def handle_join(event):
     reply_text(
         event.reply_token,
         "大家好～我進來了 👋\n"
-        "我可以把含特定關鍵字的訊息整理成 txt（日報）。\n"
+        "我可以把含特定關鍵字的訊息整理成 txt 並提供下載連結。\n"
         "輸入『功能選單』開始設定。",
     )
 
@@ -561,46 +593,36 @@ def handle_join(event):
 # -----------------------------
 # Postback actions
 # -----------------------------
-def parse_postback_data(data: str) -> dict:
-    # data 形式：action=xxx&kw=...
-    out = {}
-    for part in data.split("&"):
-        if "=" in part:
-            k, v = part.split("=", 1)
-            out[k] = v
-    return out
-
-
 @handler.add(PostbackEvent)
 def handle_postback(event):
     data = getattr(getattr(event, "postback", None), "data", "") or ""
     chat_id = get_chat_id(event)
-    p = parse_postback_data(data)
-    action = p.get("action", "")
 
-    if action == "set_keyword":
+    if data == "action=run_now":
+        ok, msg, _ = summarize_today(chat_id, manual=True)
+        return reply_text(event.reply_token, msg)
+
+    if data == "action=set_keyword":
         return reply_text(
-            event.reply_token, "請輸入：設定關鍵字 你的關鍵字\n例如：設定關鍵字 日報表"
+            event.reply_token,
+            "請輸入：設定關鍵字 你的關鍵字\n例如：設定關鍵字 日報表",
         )
 
-    if action == "list_keyword":
+    if data == "action=list_keyword":
         cfg = load_cfg(chat_id)
         kws = [k for k in cfg.get("keywords", []) if isinstance(k, str) and k.strip()]
-        kws = sorted(set(kws), key=lambda x: x.lower())
         if not kws:
             return reply_text(
                 event.reply_token,
-                "目前尚未設定任何關鍵字。\n\n請輸入：設定關鍵字 你的關鍵字\n例如：設定關鍵字 日報表",
+                "目前尚未設定任何關鍵字。\n請輸入：設定關鍵字 日報表",
             )
         return reply_text(event.reply_token, "目前關鍵字：\n- " + "\n- ".join(kws))
 
-    if action == "delete_keyword":
-        return reply_delete_keyword_buttons(event.reply_token, chat_id)
+    if data == "action=delete_keyword_menu":
+        return reply_keyword_delete_buttons(event.reply_token, chat_id)
 
-    if action == "del_kw":
-        kw = p.get("kw", "").strip()
-        if not kw:
-            return reply_text(event.reply_token, "刪除失敗：關鍵字不存在")
+    if data.startswith("action=delete_kw&kw="):
+        kw = data.split("action=delete_kw&kw=", 1)[1]
         cfg = load_cfg(chat_id)
         before = [k for k in cfg.get("keywords", []) if isinstance(k, str)]
         after = [k for k in before if k != kw]
@@ -608,42 +630,27 @@ def handle_postback(event):
         save_cfg(chat_id, cfg)
         return reply_text(event.reply_token, f"已刪除關鍵字 ✅\n- {kw}")
 
-    if action == "run_now":
-        ok, msg, outputs = summarize_today_per_keyword(chat_id, manual=True)
-        reply_text(event.reply_token, msg)
-
-        # 同時「推播檔案」做備份（如果有 url）
-        for o in outputs:
-            if o.get("url"):
-                # 檔名顯示用
-                file_name = Path(o["out_path"]).name
-                try:
-                    size = Path(o["out_path"]).stat().st_size
-                except Exception:
-                    size = 1
-                sent = try_send_file_message(chat_id, file_name, o["url"], size)
-                if not sent:
-                    # fallback：再補一行連結（避免 SDK/通道不支援檔案訊息）
-                    push_text(chat_id, f"備份檔案（{o['keyword']}）：{o['url']}")
-        return
-
-    if action == "set_daily_time":
+    if data == "action=set_daily_time":
         return reply_text(
-            event.reply_token, "請輸入：設定每日時間 HH:MM\n例如：設定每日時間 23:55"
+            event.reply_token,
+            "請輸入：設定每日時間 HH:MM\n例如：設定每日時間 23:55",
         )
 
-    if action == "disable_daily":
+    if data == "action=disable_daily":
         cfg = load_cfg(chat_id)
-        cfg["daily_time"] = None
+        cfg["daily_enabled"] = False
         save_cfg(chat_id, cfg)
         return reply_text(event.reply_token, "已關閉每日自動整理 ✅")
 
-    if action == "show_daily":
+    if data == "action=show_daily":
         cfg = load_cfg(chat_id)
-        t = cfg.get("daily_time")
-        if t:
-            return reply_text(event.reply_token, f"目前每日自動整理時間：{t}")
-        return reply_text(event.reply_token, "目前未啟用每日自動整理。")
+        enabled = "啟用" if cfg.get("daily_enabled") else "未啟用"
+        return reply_text(
+            event.reply_token,
+            f"每日自動整理：{enabled}\n"
+            f"時間：{cfg.get('daily_time','23:59')}\n"
+            f"上次執行：{cfg.get('last_run_date','') or '尚未'}",
+        )
 
     return reply_text(
         event.reply_token,
@@ -654,198 +661,102 @@ def handle_postback(event):
 # -----------------------------
 # Text messages
 # -----------------------------
-def is_valid_hhmm(s: str) -> bool:
-    m = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", s.strip())
-    return bool(m)
-
-
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     text = (event.message.text or "").strip()
-    if not text:
-        return
-
     chat_id = get_chat_id(event)
 
-    # 先記錄（避免漏紀錄）
-    append_log(chat_id, text, event)
+    # record first
+    if text:
+        append_log(chat_id, text, event)
 
-    # 指令：功能選單
+    # menu
     if text in {"功能選單", "menu", "選單"}:
         return reply_menu(event.reply_token)
 
-    # 設定關鍵字
+    # keyword add
     if text.startswith("設定關鍵字"):
         kw = text.replace("設定關鍵字", "", 1).strip()
-        kw = normalize_keyword(kw)
         if not kw:
-            return reply_text(
-                event.reply_token,
-                "請輸入：設定關鍵字 你的關鍵字\n例如：設定關鍵字 日報表",
-            )
+            return reply_text(event.reply_token, "格式：設定關鍵字 日報表")
         cfg = load_cfg(chat_id)
         kws = set([k for k in cfg.get("keywords", []) if isinstance(k, str)])
         kws.add(kw)
-        cfg["keywords"] = sorted(kws, key=lambda x: x.lower())
+        cfg["keywords"] = sorted(kws)
         save_cfg(chat_id, cfg)
         return reply_text(
             event.reply_token,
             f"已新增關鍵字 ✅\n- {kw}\n\n輸入『立即整理』可馬上測試。",
         )
 
-    # 查看關鍵字
-    if text in {"查看關鍵字", "關鍵字", "keywords"}:
-        cfg = load_cfg(chat_id)
-        kws = [k for k in cfg.get("keywords", []) if isinstance(k, str) and k.strip()]
-        kws = sorted(set(kws), key=lambda x: x.lower())
-        if not kws:
-            return reply_text(
-                event.reply_token,
-                "目前尚未設定任何關鍵字。\n\n請輸入：設定關鍵字 你的關鍵字\n例如：設定關鍵字 日報表",
-            )
-        return reply_text(event.reply_token, "目前關鍵字：\n- " + "\n- ".join(kws))
-
-    # 刪除關鍵字：改成按鈕模式（不手打）
-    if text in {"刪除關鍵字", "刪關鍵字", "delete"}:
-        return reply_delete_keyword_buttons(event.reply_token, chat_id)
-
-    # 兼容：手打刪除（若你想保留）
-    if text.startswith("刪除關鍵字 "):
+    # manual delete fallback (still supported)
+    if text.startswith("刪除關鍵字"):
         kw = text.replace("刪除關鍵字", "", 1).strip()
         if not kw:
             return reply_text(event.reply_token, "格式：刪除關鍵字 日報表")
         cfg = load_cfg(chat_id)
-        before = [k for k in cfg.get("keywords", []) if isinstance(k, str)]
-        after = [k for k in before if k != kw]
-        cfg["keywords"] = after
+        cfg["keywords"] = [k for k in cfg.get("keywords", []) if k != kw]
         save_cfg(chat_id, cfg)
         return reply_text(event.reply_token, f"已刪除關鍵字 ✅\n- {kw}")
 
-    # 立即整理
+    # list keywords
+    if text in {"查看關鍵字", "關鍵字", "keywords"}:
+        cfg = load_cfg(chat_id)
+        kws = [k for k in cfg.get("keywords", []) if isinstance(k, str) and k.strip()]
+        if not kws:
+            return reply_text(
+                event.reply_token, "目前尚未設定任何關鍵字。\n請輸入：設定關鍵字 日報表"
+            )
+        return reply_text(event.reply_token, "目前關鍵字：\n- " + "\n- ".join(kws))
+
+    # run now
     if text in {"立即整理", "整理", "run"}:
-        ok, msg, outputs = summarize_today_per_keyword(chat_id, manual=True)
-        reply_text(event.reply_token, msg)
+        ok, msg, _ = summarize_today(chat_id, manual=True)
+        return reply_text(event.reply_token, msg)
 
-        # 同時推播檔案（若有 url）
-        for o in outputs:
-            if o.get("url"):
-                file_name = Path(o["out_path"]).name
-                try:
-                    size = Path(o["out_path"]).stat().st_size
-                except Exception:
-                    size = 1
-                sent = try_send_file_message(chat_id, file_name, o["url"], size)
-                if not sent:
-                    push_text(chat_id, f"備份檔案（{o['keyword']}）：{o['url']}")
-        return
-
-    # 設定每日時間
+    # set daily time (enable)
     if text.startswith("設定每日時間"):
         t = text.replace("設定每日時間", "", 1).strip()
-        if not is_valid_hhmm(t):
+        hhmm = _parse_hhmm(t)
+        if not hhmm:
             return reply_text(
-                event.reply_token,
-                "時間格式不正確。\n請輸入：設定每日時間 HH:MM\n例如：設定每日時間 23:55",
+                event.reply_token, "格式：設定每日時間 HH:MM\n例如：設定每日時間 23:55"
             )
         cfg = load_cfg(chat_id)
-        cfg["daily_time"] = t
+        cfg["daily_time"] = f"{hhmm[0]:02d}:{hhmm[1]:02d}"
+        cfg["daily_enabled"] = True
         save_cfg(chat_id, cfg)
         return reply_text(
             event.reply_token,
-            f"已設定每日整理時間 ✅\n時間：{t}\n（如已啟用，將自動套用）",
+            f"已設定每日整理時間 ✅\n時間：{cfg['daily_time']}\n（如已啟用，將自動套用）",
         )
 
+    # show current daily settings
+    if text in {"查看目前設定", "每日設定"}:
+        cfg = load_cfg(chat_id)
+        enabled = "啟用" if cfg.get("daily_enabled") else "未啟用"
+        return reply_text(
+            event.reply_token,
+            f"每日自動整理：{enabled}\n"
+            f"時間：{cfg.get('daily_time','23:59')}\n"
+            f"上次執行：{cfg.get('last_run_date','') or '尚未'}",
+        )
+
+    # disable daily
     if text in {"關閉每日整理", "停止每日整理"}:
         cfg = load_cfg(chat_id)
-        cfg["daily_time"] = None
+        cfg["daily_enabled"] = False
         save_cfg(chat_id, cfg)
         return reply_text(event.reply_token, "已關閉每日自動整理 ✅")
 
-    # 非指令：不回覆，避免群組洗版
+    # non-command: no reply (avoid spamming in group)
     return
-
-
-# -----------------------------
-# Scheduler: tick every minute (cloud-friendly)
-# -----------------------------
-def tick_daily_scheduler():
-    """
-    每分鐘跑一次：
-      - 找出設定了 daily_time 的聊天室
-      - 若現在 HH:MM 命中且今天還沒跑過 -> 自動整理 + push
-    """
-    now = now_tpe()
-    now_hhmm = hhmm(now)
-    today = today_ymd(now)
-
-    for p in CFG_DIR.glob("*.json"):
-        chat_id = p.stem
-        cfg = load_cfg(chat_id)
-        t = cfg.get("daily_time")
-        if not t:
-            continue
-
-        if t != now_hhmm:
-            continue
-
-        if cfg.get("last_daily_run") == today:
-            continue
-
-        ok, msg, outputs = summarize_today_per_keyword(chat_id, manual=False)
-
-        # push 摘要（含下載連結）
-        try:
-            push_text(chat_id, msg)
-        except Exception as e:
-            print(f"[WARN] daily push text failed for {chat_id}: {e}")
-
-        # push 檔案備份（若有 url）
-        for o in outputs:
-            if o.get("url"):
-                file_name = Path(o["out_path"]).name
-                try:
-                    size = Path(o["out_path"]).stat().st_size
-                except Exception:
-                    size = 1
-                sent = try_send_file_message(chat_id, file_name, o["url"], size)
-                if not sent:
-                    try:
-                        push_text(chat_id, f"備份檔案（{o['keyword']}）：{o['url']}")
-                    except Exception:
-                        pass
-
-        cfg["last_daily_run"] = today
-        save_cfg(chat_id, cfg)
-
-
-def setup_scheduler():
-    """
-    APScheduler（Render 上可用）
-    用 interval 每 60 秒 tick（比 cron 更容易動態變更 daily_time）
-    """
-    try:
-        from apscheduler.schedulers.background import BackgroundScheduler
-    except Exception:
-        print("[WARN] APScheduler not installed. Install: pip install APScheduler")
-        return None
-
-    sched = BackgroundScheduler(timezone=TZ_NAME)
-    sched.add_job(tick_daily_scheduler, "interval", seconds=60, id="tick_daily")
-    sched.start()
-    print("[INFO] Scheduler started: tick every 60s.")
-    return sched
 
 
 # -----------------------------
 # Main
 # -----------------------------
-# Render 建議 Start Command：
-#   gunicorn app:app --bind 0.0.0.0:$PORT
-#
-# 本機跑：
-#   python app.py
-#
 if __name__ == "__main__":
-    setup_scheduler()
+    setup_scheduler_optional()
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
